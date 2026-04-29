@@ -15,6 +15,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { ARCHETYPES, getArchetype } from "./archetype-catalog.js";
 
 // Public installs hit prod by default. Internal dev work overrides via
 // TRIGVALE_API_BASE_URL=https://api-dev.trigvale.com.
@@ -65,10 +66,22 @@ const ValidateUrlArgsSchema = z.object({
     ),
 });
 
+// Schema for get_archetype_cautions. Pure local catalog lookup — no
+// API call, no token cost. Returns the catalog entry's structural
+// cautions for one cluster, OR a list-all when no id is provided.
+const GetArchetypeCautionsArgsSchema = z.object({
+  archetypeId: z
+    .string()
+    .optional()
+    .describe(
+      "Catalog id of the archetype to look up (e.g. 'vertical-ai-saas', 'ai-wrapper'). Omit to receive the full 16-cluster catalog with descriptions only (no per-cluster cautions, to keep the response small).",
+    ),
+});
+
 const server = new Server(
   {
     name: "trigvale",
-    version: "0.2.0",
+    version: "0.3.0",
   },
   {
     capabilities: {
@@ -122,6 +135,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["url"],
       },
     },
+    {
+      name: "get_archetype_cautions",
+      description:
+        "Return the structural cautions Trigvale surfaces for a startup-idea archetype. Useful BEFORE calling validate_idea — read the cautions for the cluster you think the idea fits, then sharpen the pitch to address those gaps before scoring. Pure local catalog lookup, no API call, no token cost, no rate limit. Pass an archetypeId to get one cluster's full cautions (3 per archetype); omit to get the full 16-archetype catalog index (id + label + description, no cautions, for browsing). Catalog ids: 'solo-dev-tools', 'vertical-ai-saas', 'ai-wrapper', 'agentic-workflow', 'api-first-saas', 'horizontal-b2b-saas', 'consumer-mobile', 'consumer-web', 'marketplace', 'creator-tools', 'compliance-saas', 'data-pipeline', 'productized-service', 'browser-extension', 'content-platform', 'niche-other'.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          archetypeId: {
+            type: "string",
+            description:
+              "Catalog id of the archetype to look up. Omit to receive the full catalog index.",
+          },
+        },
+      },
+    },
   ],
 }));
 
@@ -132,8 +160,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "validate_url") {
     return await callValidateUrl(request.params.arguments ?? {});
   }
+  if (request.params.name === "get_archetype_cautions") {
+    return callGetArchetypeCautions(request.params.arguments ?? {});
+  }
   throw new Error(`Unknown tool: ${request.params.name}`);
 });
+
+function callGetArchetypeCautions(rawArgs: unknown) {
+  const args = GetArchetypeCautionsArgsSchema.parse(rawArgs);
+  if (args.archetypeId) {
+    const meta = getArchetype(args.archetypeId);
+    if (!meta) {
+      const known = ARCHETYPES.map((a) => a.id).join(", ");
+      throw new Error(`Unknown archetypeId "${args.archetypeId}". Known ids: ${known}`);
+    }
+    const lines: string[] = [];
+    lines.push(`# ${meta.label} (${meta.id})`);
+    lines.push("");
+    lines.push(meta.description);
+    lines.push("");
+    lines.push("## Structural cautions");
+    for (const gap of meta.commonGaps) lines.push(`- ${gap}`);
+    return {
+      content: [
+        { type: "text", text: lines.join("\n") },
+        { type: "text", text: "```json\n" + JSON.stringify(meta, null, 2) + "\n```" },
+      ],
+    };
+  }
+  // No id passed — return the catalog index (lightweight; no cautions).
+  const index = ARCHETYPES.map((a) => ({
+    id: a.id,
+    label: a.label,
+    description: a.description,
+  }));
+  const lines = [
+    "# Trigvale archetype catalog (16 clusters)",
+    "",
+    "Pass `archetypeId` to get the structural cautions for one cluster.",
+    "",
+    ...index.map((a) => `- **${a.id}** — ${a.label}: ${a.description}`),
+  ];
+  return {
+    content: [
+      { type: "text", text: lines.join("\n") },
+      { type: "text", text: "```json\n" + JSON.stringify(index, null, 2) + "\n```" },
+    ],
+  };
+}
 
 async function callValidateIdea(rawArgs: unknown) {
   const args = ValidateIdeaArgsSchema.parse(rawArgs);

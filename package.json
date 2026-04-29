@@ -1,6 +1,6 @@
 {
   "name": "@trigvale/mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for Trigvale — validate startup ideas before your build agent scaffolds code. One tool: validate_idea, returns 10-dimension scorecard + kill/pivot/test/build verdict + live evidence.",
   "keywords": [
     "mcp",
