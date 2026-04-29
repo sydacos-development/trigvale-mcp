@@ -50,10 +50,25 @@ const ValidateIdeaArgsSchema = z.object({
     ),
 });
 
+// Schema for validate_url. Wraps the public POST /api/try-url endpoint
+// — Jina reader extracts the page text, Haiku rewrites as a founder
+// pitch, Sonnet 4.6 scores it. Returns a sharable URL whose dynamic OG
+// card the agent can hand back to the user. IP-rate-limited 3/day.
+const ValidateUrlArgsSchema = z.object({
+  url: z
+    .string()
+    .url()
+    .min(12)
+    .max(2048)
+    .describe(
+      "The URL of a startup landing page, Producthunt launch, GitHub README, or blog post to validate. Must be publicly reachable (no auth-walled URLs).",
+    ),
+});
+
 const server = new Server(
   {
     name: "trigvale",
-    version: "0.1.0",
+    version: "0.2.0",
   },
   {
     capabilities: {
@@ -88,15 +103,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["rawIdea"],
       },
     },
+    {
+      name: "validate_url",
+      description:
+        "Validate a startup idea given a URL (landing page, Producthunt launch, GitHub README, blog post). Trigvale fetches the page, extracts the implied founder pitch with Haiku, scores it against the rubric, and returns a verdict (kill / pivot / test / build) plus a sharable URL whose dynamic OG card unfurls on Slack/X/LinkedIn — useful for replying to a tweet about a launch with a verdict the original poster can see. Call this when the user gives you a URL to evaluate (their own competitor's site, a launch they saw on X, etc.) instead of typing the pitch out by hand. Rate-limited to 3 calls per day per IP. Auth-walled URLs (Twitter, LinkedIn) are NOT supported.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            format: "uri",
+            minLength: 12,
+            maxLength: 2048,
+            description:
+              "The URL of a startup landing page, Producthunt launch, GitHub README, or blog post to validate. Must be publicly reachable (no auth-walled URLs).",
+          },
+        },
+        required: ["url"],
+      },
+    },
   ],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name !== "validate_idea") {
-    throw new Error(`Unknown tool: ${request.params.name}`);
+  if (request.params.name === "validate_idea") {
+    return await callValidateIdea(request.params.arguments ?? {});
   }
+  if (request.params.name === "validate_url") {
+    return await callValidateUrl(request.params.arguments ?? {});
+  }
+  throw new Error(`Unknown tool: ${request.params.name}`);
+});
 
-  const args = ValidateIdeaArgsSchema.parse(request.params.arguments ?? {});
+async function callValidateIdea(rawArgs: unknown) {
+  const args = ValidateIdeaArgsSchema.parse(rawArgs);
 
   const res = await fetch(`${apiBase}/agent/v1/evaluate`, {
     method: "POST",
@@ -114,21 +154,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   const body = (await res.json()) as AgentEvaluateResponse;
 
-  // Return both the structured object (for agent reasoning) and a
-  // human-readable summary block (for chat clients that just render text).
   return {
     content: [
-      {
-        type: "text",
-        text: summarize(body),
-      },
-      {
-        type: "text",
-        text: "```json\n" + JSON.stringify(body, null, 2) + "\n```",
-      },
+      { type: "text", text: summarize(body) },
+      { type: "text", text: "```json\n" + JSON.stringify(body, null, 2) + "\n```" },
     ],
   };
-});
+}
+
+async function callValidateUrl(rawArgs: unknown) {
+  const args = ValidateUrlArgsSchema.parse(rawArgs);
+
+  // /api/try-url is a public Next.js route — token-less, IP-rate-limited.
+  // It lives on the web origin (trigvale.com), not the API Gateway base
+  // (api.trigvale.com). Default web base derives from whether the API
+  // base points at dev or prod; override via TRIGVALE_WEB_BASE_URL for
+  // local / self-hosted setups.
+  const tryUrlBase =
+    process.env.TRIGVALE_WEB_BASE_URL ??
+    (apiBase.includes("api-dev")
+      ? "https://trigvale-git-dev-sydacos.vercel.app"
+      : "https://trigvale.com");
+
+  const res = await fetch(`${tryUrlBase}/api/try-url`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: args.url }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Trigvale API ${res.status}: ${text || res.statusText}`);
+  }
+
+  const body = (await res.json()) as TryUrlResponse;
+
+  return {
+    content: [
+      { type: "text", text: summarizeUrl(body) },
+      { type: "text", text: "```json\n" + JSON.stringify(body, null, 2) + "\n```" },
+    ],
+  };
+}
 
 interface AgentEvaluateResponse {
   ideaObject: { title: string };
@@ -137,6 +204,53 @@ interface AgentEvaluateResponse {
   founderAdjustments?: { dimension: string; delta: number; reason: string }[];
   archetypeAssignments?: { archetype: string; confidence: string; rationale: string }[];
   saved?: { ideaId: string } | null;
+}
+
+interface TryUrlResponse {
+  vrs: number;
+  verdict: "kill" | "pivot" | "test" | "build";
+  title: string;
+  oneLineReason: string;
+  weakestAssumptions: string[];
+  sourceUrl: string;
+  sourceTitle: string | null;
+  shareUrl: string | null;
+  shareToken: string | null;
+  remaining: number;
+}
+
+function summarizeUrl(body: TryUrlResponse): string {
+  const lines: string[] = [];
+  lines.push(`# ${body.title}`);
+  lines.push("");
+  lines.push(`**Verdict: ${body.verdict.toUpperCase()}** · VRS ${body.vrs}/100`);
+  lines.push("");
+  lines.push(
+    `Extracted from: ${body.sourceTitle ? `${body.sourceTitle} (${body.sourceUrl})` : body.sourceUrl}`,
+  );
+  lines.push("");
+  if (body.oneLineReason) {
+    lines.push(body.oneLineReason);
+    lines.push("");
+  }
+  if (body.weakestAssumptions?.length) {
+    lines.push("Weakest assumptions:");
+    for (const a of body.weakestAssumptions) lines.push(`- ${a}`);
+    lines.push("");
+  }
+  if (body.shareUrl) {
+    lines.push(`Sharable verdict: ${body.shareUrl}`);
+    lines.push(
+      "(Reply to the original post with this URL — Slack/X/LinkedIn unfurl a Trigvale OG card with the verdict.)",
+    );
+    lines.push("");
+  }
+  if (typeof body.remaining === "number") {
+    lines.push(
+      `Daily quota: ${body.remaining} URL evaluation${body.remaining === 1 ? "" : "s"} left today on this IP.`,
+    );
+  }
+  return lines.join("\n");
 }
 
 function summarize(body: AgentEvaluateResponse): string {
