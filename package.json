@@ -1,0 +1,56 @@
+{
+  "name": "@trigvale/mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Trigvale — validate startup ideas before your build agent scaffolds code. One tool: validate_idea, returns 10-dimension scorecard + kill/pivot/test/build verdict + live evidence.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "trigvale",
+    "idea-validation",
+    "founder",
+    "startup",
+    "claude",
+    "cursor",
+    "claude-code",
+    "agent"
+  ],
+  "homepage": "https://trigvale.com/integrations",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sydacos-development/trigvale-mcp.git"
+  },
+  "bugs": {
+    "url": "https://trigvale.com/contact"
+  },
+  "license": "MIT",
+  "author": "sydacos GmbH (https://trigvale.com)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "trigvale-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.3"
+  }
+}
