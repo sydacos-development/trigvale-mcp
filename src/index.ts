@@ -78,10 +78,22 @@ const GetArchetypeCautionsArgsSchema = z.object({
     ),
 });
 
+// MCP v2 — three new lightweight tools that share a common arg shape
+// (just `rawIdea`). Each calls a dedicated /agent/v1/* endpoint.
+const RawIdeaArgsSchema = z.object({
+  rawIdea: z
+    .string()
+    .min(5)
+    .max(4000)
+    .describe(
+      "The idea to validate. Free-form text; mess is fine. Be specific about who has the pain, who pays, and why now.",
+    ),
+});
+
 const server = new Server(
   {
     name: "trigvale",
-    version: "0.3.0",
+    version: "0.4.0",
   },
   {
     capabilities: {
@@ -136,6 +148,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "quick_verdict",
+      description:
+        "Sub-second pre-build signal. Returns a 5-field shape (verdict, vrs, confidence, fatalAssumption, oneLineReason) — perfect for inline calls inside an agent loop where you need 'should I keep building?' fast and cheap. Sonnet-only, no archetype/evidence side-fetches. Use this DEFAULT for quick checks; reach for validate_idea when you need the full brief.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          rawIdea: {
+            type: "string",
+            minLength: 5,
+            maxLength: 4000,
+            description:
+              "The idea to score. Free-form text; mess is fine. Be specific about who has the pain, who pays, and why now.",
+          },
+        },
+        required: ["rawIdea"],
+      },
+    },
+    {
+      name: "detect_fatal_assumption",
+      description:
+        "Returns ONLY the single most load-bearing assumption — what would have to be true for the idea to work, plus why it's load-bearing. Useful when an agent has decided to build but wants a brutal one-line 'what would kill this' check before diving in. Same Sonnet cost as quick_verdict; different focus.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          rawIdea: {
+            type: "string",
+            minLength: 5,
+            maxLength: 4000,
+            description: "The idea to inspect. Free-form text; mess is fine.",
+          },
+        },
+        required: ["rawIdea"],
+      },
+    },
+    {
+      name: "classify_archetype",
+      description:
+        "Map an idea to 1–3 of Trigvale's 16 startup archetypes (e.g. 'ai-wrapper', 'vertical-ai-saas', 'marketplace') and return each cluster's known failure modes from the catalog. Two cheap Haiku calls. Useful for agents that want to know 'what shape is this?' before deciding whether to invest in a full validation. Distinct from get_archetype_cautions (which is a static catalog lookup) — this one runs the actual classifier on the idea text.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          rawIdea: {
+            type: "string",
+            minLength: 5,
+            maxLength: 4000,
+            description: "The idea to classify. Free-form text; mess is fine.",
+          },
+        },
+        required: ["rawIdea"],
+      },
+    },
+    {
       name: "get_archetype_cautions",
       description:
         "Return the structural cautions Trigvale surfaces for a startup-idea archetype. Useful BEFORE calling validate_idea — read the cautions for the cluster you think the idea fits, then sharpen the pitch to address those gaps before scoring. Pure local catalog lookup, no API call, no token cost, no rate limit. Pass an archetypeId to get one cluster's full cautions (3 per archetype); omit to get the full 16-archetype catalog index (id + label + description, no cautions, for browsing). Catalog ids: 'solo-dev-tools', 'vertical-ai-saas', 'ai-wrapper', 'agentic-workflow', 'api-first-saas', 'horizontal-b2b-saas', 'consumer-mobile', 'consumer-web', 'marketplace', 'creator-tools', 'compliance-saas', 'data-pipeline', 'productized-service', 'browser-extension', 'content-platform', 'niche-other'.",
@@ -160,11 +224,91 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "validate_url") {
     return await callValidateUrl(request.params.arguments ?? {});
   }
+  if (request.params.name === "quick_verdict") {
+    return await callMcpV2("quick-verdict", request.params.arguments ?? {});
+  }
+  if (request.params.name === "detect_fatal_assumption") {
+    return await callMcpV2("detect-fatal-assumption", request.params.arguments ?? {});
+  }
+  if (request.params.name === "classify_archetype") {
+    return await callMcpV2("classify-archetype", request.params.arguments ?? {});
+  }
   if (request.params.name === "get_archetype_cautions") {
     return callGetArchetypeCautions(request.params.arguments ?? {});
   }
   throw new Error(`Unknown tool: ${request.params.name}`);
 });
+
+/**
+ * Common dispatcher for the three MCP v2 tools — each shares the same
+ * `{ rawIdea }` argument shape and POSTs to a /agent/v1/<endpoint>
+ * route. The summary pulls headline fields based on the response shape;
+ * the second content block is always the raw JSON for agents that want
+ * to programmatically consume it.
+ */
+async function callMcpV2(endpoint: string, rawArgs: unknown) {
+  const args = RawIdeaArgsSchema.parse(rawArgs);
+  const res = await fetch(`${apiBase}/agent/v1/${endpoint}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${agentToken}`,
+    },
+    body: JSON.stringify({ rawIdea: args.rawIdea }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Trigvale API ${res.status}: ${text || res.statusText}`);
+  }
+  const body = (await res.json()) as Record<string, unknown>;
+  return {
+    content: [
+      { type: "text" as const, text: summarizeMcpV2(endpoint, body) },
+      { type: "text" as const, text: "```json\n" + JSON.stringify(body, null, 2) + "\n```" },
+    ],
+  };
+}
+
+function summarizeMcpV2(endpoint: string, body: Record<string, unknown>): string {
+  if (endpoint === "quick-verdict") {
+    const verdict = String(body.verdict ?? "?").toUpperCase();
+    const vrs = body.vrs ?? "?";
+    const conf = body.confidence ?? "?";
+    return [
+      `**${verdict}** · VRS ${vrs}/100 · ${conf} confidence`,
+      "",
+      `_${body.oneLineReason ?? ""}_`,
+      "",
+      `**Fatal assumption:** ${body.fatalAssumption ?? ""}`,
+    ].join("\n");
+  }
+  if (endpoint === "detect-fatal-assumption") {
+    return [
+      `**Most load-bearing assumption** (${body.confidence ?? "?"} confidence):`,
+      "",
+      String(body.assumption ?? ""),
+      "",
+      `**Why it's critical:** ${body.whyCritical ?? ""}`,
+    ].join("\n");
+  }
+  if (endpoint === "classify-archetype") {
+    const assignments = (body.assignments as Array<Record<string, unknown>>) ?? [];
+    const lines: string[] = ["# Archetype assignments", ""];
+    for (const a of assignments) {
+      lines.push(`## ${a.label ?? a.archetype} (${a.confidence ?? "?"} confidence)`);
+      lines.push(String(a.rationale ?? ""));
+      const failures = (a.knownFailureModes as string[]) ?? [];
+      if (failures.length > 0) {
+        lines.push("");
+        lines.push("**Known failure modes for this cluster:**");
+        for (const f of failures) lines.push(`- ${f}`);
+      }
+      lines.push("");
+    }
+    return lines.join("\n");
+  }
+  return JSON.stringify(body, null, 2);
+}
 
 function callGetArchetypeCautions(rawArgs: unknown) {
   const args = GetArchetypeCautionsArgsSchema.parse(rawArgs);
